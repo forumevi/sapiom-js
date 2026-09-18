@@ -1,4 +1,5 @@
 import { isWithinDir, pathComparisonKey, pathSegmentDepth } from "./paths.js";
+/** Use locale-independent ordering for deterministic root selection. */
 const lexicalCompare = (a: string, b: string): number =>
   a === b ? 0 : a < b ? -1 : 1;
 
@@ -66,6 +67,7 @@ export type ProjectRootMatch<T> =
   | { kind: "unregistered" }
   | { kind: "ambiguous"; projectIds: string[] };
 
+/** Compatibility wrapper returning null for missing or ambiguous project roots. */
 export function resolveProjectRootForPath<T extends DurableProjectRoot>(
   targetPath: string,
   roots: readonly T[],
