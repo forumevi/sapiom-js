@@ -14,7 +14,10 @@ import {
 import type { WorkspaceScopeSummary } from "../shared/workspace-scope.js";
 import { matchProjectRootForPath } from "../shared/project-roots.js";
 import { pathComparisonKey } from "../shared/paths.js";
-import { canonicalGraphPath } from "./canonical-graph-path.js";
+import {
+  canonicalGraphPath,
+  refreshCanonicalGraphPath,
+} from "./canonical-graph-path.js";
 import {
   DurableFileLock,
   type DurableFileLockTestHooks,
@@ -487,7 +490,7 @@ export class StudioProjectCatalog {
     await this.load(true);
     let canonical: string;
     try {
-      canonical = canonicalGraphPath(cwd);
+      canonical = refreshCanonicalGraphPath(cwd);
     } catch {
       return { kind: "unavailable" };
     }
@@ -498,7 +501,7 @@ export class StudioProjectCatalog {
           .filter(({ status }) => status === "active")
           .flatMap((binding) => {
             try {
-              const root = canonicalGraphPath(binding.localRootRef);
+              const root = refreshCanonicalGraphPath(binding.localRootRef);
               return [{ projectId: project.projectId, cwd: root, project }];
             } catch {
               return [];

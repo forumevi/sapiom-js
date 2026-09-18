@@ -49,11 +49,20 @@ export function rememberCanonicalGraphPath(
  * providers and watcher paths that have not yet been reconciled.
  */
 export function canonicalGraphPath(input: string): string {
+  return resolveCanonicalGraphPath(input, false);
+}
+
+/** Refresh filesystem identity when no registry watcher keeps the cache current. */
+export function refreshCanonicalGraphPath(input: string): string {
+  return resolveCanonicalGraphPath(input, true);
+}
+
+function resolveCanonicalGraphPath(input: string, fresh: boolean): string {
   const windows = isWindowsAbsolute(input);
   const api = pathApi(input);
   const resolved = normalizedAbsolute(input);
   const cached = canonicalPaths.get(resolved);
-  if (cached !== undefined) {
+  if (!fresh && cached !== undefined) {
     remember(resolved, cached);
     return cached;
   }
