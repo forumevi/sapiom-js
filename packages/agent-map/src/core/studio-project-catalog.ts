@@ -1,5 +1,5 @@
-import { isStudioProjectId } from "@sapiom/agent-map/project-id";
-export { isStudioProjectId } from "@sapiom/agent-map/project-id";
+import { isStudioProjectId } from "../shared/project-id.js";
+export { isStudioProjectId } from "../shared/project-id.js";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -10,15 +10,15 @@ import {
   type ProjectRootBindingStatus,
   type StudioProjectId,
   type StudioProjectSummary,
-} from "@sapiom/agent-map";
+} from "../shared/agent-map.js";
 import type { WorkspaceScopeSummary } from "../shared/workspace-scope.js";
-import { resolveProjectRootForPath } from "../shared/project-roots.js";
+import { matchProjectRootForPath } from "../shared/project-roots.js";
 import { pathComparisonKey } from "../shared/paths.js";
 import { canonicalGraphPath } from "./canonical-graph-path.js";
 import {
   DurableFileLock,
   type DurableFileLockTestHooks,
-} from "@sapiom/agent-map/node/durable-file-lock";
+} from "./durable-file-lock.js";
 
 export interface ProjectRootBinding {
   id: string;
@@ -55,6 +55,12 @@ export interface ResolvedStudioProjectIdentity {
   identityVersion: number;
   displayName: string;
 }
+
+export type StudioProjectPathLookup =
+  | { kind: "resolved"; project: ResolvedStudioProjectIdentity }
+  | { kind: "unregistered" }
+  | { kind: "ambiguous"; projectIds: string[] }
+  | { kind: "unavailable" };
 
 export class StudioProjectCatalogError extends Error {
   constructor(readonly code: Exclude<AgentMapErrorCode, "project_not_found">) {
@@ -468,20 +474,26 @@ export class StudioProjectCatalog {
    * Resolves a cwd to the most-specific active durable project root. Local
    * roots remain private; ambiguous equal-specificity matches fail closed.
    */
-  async resolveIdentityForPath(
+  async resolveIdentityForPath(cwd: string): Promise<ResolvedStudioProjectIdentity | null> {
+    const result = await this.lookupIdentityForPath(cwd);
+    return result.kind === "resolved" ? result.project : null;
+  }
+
+  async lookupIdentityForPath(
     cwd: string,
-  ): Promise<ResolvedStudioProjectIdentity | null> {
+    projectId?: StudioProjectId,
+  ): Promise<StudioProjectPathLookup> {
     await this.mutationQueue;
     await this.load(true);
     let canonical: string;
     try {
       canonical = canonicalGraphPath(cwd);
     } catch {
-      return null;
+      return { kind: "unavailable" };
     }
-    const match = resolveProjectRootForPath(
+    const match = matchProjectRootForPath(
       canonical,
-      this.projects!.flatMap((project) =>
+      this.projects!.filter((project) => !projectId || project.projectId === projectId).flatMap((project) =>
         project.rootBindings
           .filter(({ status }) => status === "active")
           .flatMap((binding) => {
@@ -494,13 +506,13 @@ export class StudioProjectCatalog {
           }),
       ),
     );
-    if (!match) return null;
-    const project = match.project;
-    return {
+    if (match.kind !== "resolved") return match;
+    const project = match.root.project;
+    return { kind: "resolved", project: {
       projectId: project.projectId,
       identityVersion: project.identityVersion,
       displayName: project.displayName,
-    };
+    } };
   }
 
   async create(displayName: string): Promise<StudioProjectSummary> {
