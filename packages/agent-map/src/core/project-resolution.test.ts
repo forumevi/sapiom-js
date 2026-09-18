@@ -1,7 +1,8 @@
+import { realpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { resolveAgentMapProject } from "./project-resolution.js";
 import { StudioProjectCatalog } from "./studio-project-catalog.js";
 
@@ -14,6 +15,7 @@ beforeEach(async () => {
   catalogPath = join(stateRoot, "studio-projects.json");
 });
 afterEach(async () => {
+  vi.restoreAllMocks();
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -241,6 +243,37 @@ it("reports unavailable state for malformed catalogs without rewriting them", as
     }),
   ).toEqual({ kind: "unavailable" });
 });
+
+it.each(
+  ["EACCES", "EPERM", "EIO", "ELOOP"].flatMap((code) =>
+    ["cwd", "ancestor", "binding"].map((location) => ({ code, location })),
+  ),
+)(
+  "reports unavailable for $code at the $location",
+  async ({ code, location }) => {
+    const { cwd, catalog } = await registered();
+    await fs.mkdir(cwd);
+    const blocked = location === "binding" ? join(root, "blocked") : cwd;
+    if (location === "binding") {
+      const second = await catalog.create("Blocked project");
+      await catalog.addRootBinding(second.projectId, blocked);
+    }
+    const native = realpathSync.native;
+    vi.spyOn(realpathSync, "native").mockImplementation((path) => {
+      if (path.toString() === blocked) {
+        throw Object.assign(new Error("Filesystem unavailable"), { code });
+      }
+      return native(path);
+    });
+    expect(
+      await resolveAgentMapProject({
+        kind: "repository",
+        stateRoot,
+        cwd: location === "ancestor" ? join(cwd, "missing") : cwd,
+      }),
+    ).toEqual({ kind: "unavailable" });
+  },
+);
 
 it("rejects an invalid explicit selector instead of falling back to cwd", async () => {
   const { cwd } = await registered();

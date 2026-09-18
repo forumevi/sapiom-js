@@ -52,9 +52,15 @@ export function canonicalGraphPath(input: string): string {
   return resolveCanonicalGraphPath(input, false);
 }
 
-/** Refresh filesystem identity when no registry watcher keeps the cache current. */
+/** Refresh identity without a watcher; non-missing filesystem errors propagate. */
 export function refreshCanonicalGraphPath(input: string): string {
   return resolveCanonicalGraphPath(input, true);
+}
+
+/** Only missing path segments permit reconstructing identity from an ancestor. */
+function isMissingPathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
 }
 
 function resolveCanonicalGraphPath(input: string, fresh: boolean): string {
@@ -72,7 +78,9 @@ function resolveCanonicalGraphPath(input: string, fresh: boolean): string {
   try {
     probe?.(resolved);
     result = realpathSync.native(resolved);
-  } catch {
+  } catch (error) {
+    // Cached graph projections retain their legacy best-effort fallback.
+    if (fresh && !isMissingPathError(error)) throw error;
     const missingSegments: string[] = [];
     let ancestor = resolved;
     let parent = api.dirname(ancestor);
@@ -83,7 +91,8 @@ function resolveCanonicalGraphPath(input: string, fresh: boolean): string {
         probe?.(ancestor);
         result = api.join(realpathSync.native(ancestor), ...missingSegments);
         break;
-      } catch {
+      } catch (error) {
+        if (fresh && !isMissingPathError(error)) throw error;
         parent = api.dirname(ancestor);
       }
     }

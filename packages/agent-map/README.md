@@ -31,4 +31,6 @@ Lookup is side-effect-free: it never registers a project or creates a map. Stora
 
 Repository lookups refresh filesystem identity for both the working directory and catalog roots, including symlinks created or retargeted since a previous lookup. The browser-safe `@sapiom/agent-map/project-roots` matcher normalizes `.` and `..` lexically before containment and depth comparison; hosts must resolve symlinks before calling it directly.
 
+Missing descendants can resolve through their nearest existing ancestor. Permission failures, symlink loops, and other filesystem errors produce `unavailable`, including errors reading candidate catalog roots.
+
 Studio owns discovery and calls the shared catalog's `reconcile` with the complete root inventory. A standalone lookup must never call `reconcile([cwd])`, which would mark other roots missing. Explicit registration uses catalog `create`/`addRootBinding` methods under the existing catalog lock; additional roots must be registered to reuse a project across worktrees.
