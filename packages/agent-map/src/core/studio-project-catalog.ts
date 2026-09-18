@@ -482,40 +482,42 @@ export class StudioProjectCatalog {
     return result.kind === "resolved" ? result.project : null;
   }
 
+  /** Unreadable candidate roots make reliable project disambiguation unavailable. */
   async lookupIdentityForPath(
     cwd: string,
     projectId?: StudioProjectId,
   ): Promise<StudioProjectPathLookup> {
     await this.mutationQueue;
     await this.load(true);
-    let canonical: string;
     try {
-      canonical = refreshCanonicalGraphPath(cwd);
+      const canonical = refreshCanonicalGraphPath(cwd);
+      const match = matchProjectRootForPath(
+        canonical,
+        this.projects!
+          .filter((project) => !projectId || project.projectId === projectId)
+          .flatMap((project) =>
+            project.rootBindings
+              .filter(({ status }) => status === "active")
+              .map((binding) => ({
+                projectId: project.projectId,
+                cwd: refreshCanonicalGraphPath(binding.localRootRef),
+                project,
+              })),
+          ),
+      );
+      if (match.kind !== "resolved") return match;
+      const project = match.root.project;
+      return {
+        kind: "resolved",
+        project: {
+          projectId: project.projectId,
+          identityVersion: project.identityVersion,
+          displayName: project.displayName,
+        },
+      };
     } catch {
       return { kind: "unavailable" };
     }
-    const match = matchProjectRootForPath(
-      canonical,
-      this.projects!.filter((project) => !projectId || project.projectId === projectId).flatMap((project) =>
-        project.rootBindings
-          .filter(({ status }) => status === "active")
-          .flatMap((binding) => {
-            try {
-              const root = refreshCanonicalGraphPath(binding.localRootRef);
-              return [{ projectId: project.projectId, cwd: root, project }];
-            } catch {
-              return [];
-            }
-          }),
-      ),
-    );
-    if (match.kind !== "resolved") return match;
-    const project = match.root.project;
-    return { kind: "resolved", project: {
-      projectId: project.projectId,
-      identityVersion: project.identityVersion,
-      displayName: project.displayName,
-    } };
   }
 
   async create(displayName: string): Promise<StudioProjectSummary> {
