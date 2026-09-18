@@ -5,16 +5,19 @@ const MAX_CACHED_PATHS = 20_000;
 const canonicalPaths = new Map<string, string>();
 let probe: ((path: string) => void) | null = null;
 
+/** Recognize drive and UNC syntax independently of the current operating system. */
 function isWindowsAbsolute(input: string): boolean {
   return (
     /^[A-Za-z]:[\\/]/.test(input) || /^[\\/]{2}[^\\/]+[\\/][^\\/]+/.test(input)
   );
 }
 
+/** Choose lexical parsing rules from the input, including foreign-host paths. */
 function pathApi(input: string): typeof path.posix {
   return isWindowsAbsolute(input) ? path.win32 : path.posix;
 }
 
+/** Resolve lexical segments before caching or probing filesystem identity. */
 function normalizedAbsolute(input: string): string {
   const api = pathApi(input);
   return api.resolve(
@@ -22,6 +25,7 @@ function normalizedAbsolute(input: string): string {
   );
 }
 
+/** Refresh LRU order and bound the shared canonical-path cache. */
 function remember(key: string, value: string): void {
   canonicalPaths.delete(key);
   canonicalPaths.set(key, value);
@@ -63,6 +67,7 @@ function isMissingPathError(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
+/** Fresh scope lookup surfaces I/O failures; graph projection stays best effort. */
 function resolveCanonicalGraphPath(input: string, fresh: boolean): string {
   const windows = isWindowsAbsolute(input);
   const api = pathApi(input);
@@ -108,6 +113,7 @@ export function setCanonicalGraphPathProbeForTest(
   probe = next;
 }
 
+/** Reset process-wide canonical evidence and its probe between isolated tests. */
 export function clearCanonicalGraphPathCacheForTest(): void {
   canonicalPaths.clear();
   probe = null;
