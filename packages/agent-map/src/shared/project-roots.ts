@@ -1,7 +1,28 @@
 import { isWithinDir, pathComparisonKey, pathSegmentDepth } from "./paths.js";
-const canonical = pathComparisonKey;
 const lexicalCompare = (a: string, b: string): number =>
   a === b ? 0 : a < b ? -1 : 1;
+
+/** Lexical normalization only; filesystem identity is resolved by the host. */
+function normalizedPath(input: string): string {
+  const path = input.replace(/\\/g, "/");
+  // Keep a drive or UNC server/share together so `..` cannot leave its root.
+  const prefix =
+    path.match(/^(?:[A-Za-z]:\/|\/\/[^/]+\/[^/]+(?:\/|$)|\/)/)?.[0] ?? "";
+  const segments: string[] = [];
+  for (const segment of path.slice(prefix.length).split("/")) {
+    if (!segment || segment === ".") continue;
+    if (
+      segment === ".." &&
+      segments.length &&
+      segments[segments.length - 1] !== ".."
+    ) {
+      segments.pop();
+    } else if (segment !== ".." || !prefix) {
+      segments.push(segment);
+    }
+  }
+  return pathComparisonKey(prefix + segments.join("/"));
+}
 
 export interface DurableProjectRoot {
   projectId: string;
@@ -17,21 +38,26 @@ export function matchProjectRootForPath<T extends DurableProjectRoot>(
   targetPath: string,
   roots: readonly T[],
 ): ProjectRootMatch<T> {
-  const matches = roots.filter((root) => isWithinDir(root.cwd, targetPath));
+  const target = normalizedPath(targetPath);
+  const matches = roots
+    .map((root) => ({ root, path: normalizedPath(root.cwd) }))
+    .filter(({ path }) => isWithinDir(path, target));
   if (matches.length === 0) return { kind: "unregistered" };
-  const depth = Math.max(...matches.map((root) => pathSegmentDepth(root.cwd)));
+  const depth = Math.max(...matches.map(({ path }) => pathSegmentDepth(path)));
   const nearest = matches.filter(
-    (root) => pathSegmentDepth(root.cwd) === depth,
+    ({ path }) => pathSegmentDepth(path) === depth,
   );
-  const projectIds = [...new Set(nearest.map((root) => root.projectId))].sort();
+  const projectIds = [
+    ...new Set(nearest.map(({ root }) => root.projectId)),
+  ].sort();
   if (projectIds.length !== 1) return { kind: "ambiguous", projectIds };
   return {
     kind: "resolved",
     root: [...nearest].sort(
       (left, right) =>
-        lexicalCompare(canonical(left.cwd), canonical(right.cwd)) ||
-        lexicalCompare(left.cwd, right.cwd),
-    )[0]!,
+        lexicalCompare(left.path, right.path) ||
+        lexicalCompare(left.root.cwd, right.root.cwd),
+    )[0]!.root,
   };
 }
 

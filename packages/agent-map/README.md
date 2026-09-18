@@ -29,6 +29,8 @@ Results are `resolved`, `unregistered`, `ambiguous`, or `unavailable`. A resolve
 
 Lookup is side-effect-free: it never registers a project or creates a map. Storage remains `<stateRoot>/agent-map/projects/<projectId>/workspace.json`; the default state root is `~/.sapiom/harness`.
 
+Repository lookups refresh filesystem identity for both the working directory and catalog roots, including symlinks created or retargeted since a previous lookup. The browser-safe `@sapiom/agent-map/project-roots` matcher normalizes `.` and `..` lexically before containment and depth comparison; hosts must resolve symlinks before calling it directly.
+
 Studio owns discovery and calls the shared catalog's `reconcile` with the complete root inventory. A standalone lookup must never call `reconcile([cwd])`, which would mark other roots missing. Explicit registration uses catalog `create`/`addRootBinding` methods under the existing catalog lock; additional roots must be registered to reuse a project across worktrees.
 
 ## Exports and verification

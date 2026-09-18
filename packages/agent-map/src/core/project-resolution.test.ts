@@ -158,6 +158,74 @@ it("reports ambiguous legacy Windows roots and permits an explicit project choic
   expect(await fs.readFile(catalogPath, "utf8")).toBe(serialized);
 });
 
+it("discovers an alias created after an unsuccessful repository lookup", async () => {
+  const { project, cwd } = await registered();
+  await fs.mkdir(cwd);
+  const alias = join(root, "alias");
+  const input = {
+    kind: "repository" as const,
+    stateRoot,
+    cwd: join(alias, "src"),
+  };
+  expect(await resolveAgentMapProject(input)).toEqual({ kind: "unregistered" });
+  await fs.symlink(cwd, alias, "junction");
+  expect(await resolveAgentMapProject(input)).toMatchObject({
+    kind: "resolved",
+    projectId: project.projectId,
+  });
+});
+
+it("resolves a retargeted repository alias to its current project", async () => {
+  const { catalog, project, cwd } = await registered();
+  const secondRoot = join(root, "second");
+  const second = await catalog.create("Second");
+  await catalog.addRootBinding(second.projectId, secondRoot);
+  await fs.mkdir(cwd);
+  await fs.mkdir(secondRoot);
+  const alias = join(root, "alias");
+  await fs.symlink(cwd, alias, "junction");
+  const input = {
+    kind: "repository" as const,
+    stateRoot,
+    cwd: join(alias, "src"),
+  };
+  expect(await resolveAgentMapProject(input)).toMatchObject({
+    kind: "resolved",
+    projectId: project.projectId,
+  });
+  await fs.unlink(alias);
+  await fs.symlink(secondRoot, alias, "junction");
+  expect(await resolveAgentMapProject(input)).toMatchObject({
+    kind: "resolved",
+    projectId: second.projectId,
+  });
+});
+
+it("refreshes a root binding registered before its symlink exists", async () => {
+  const alias = join(root, "alias");
+  const { project } = await registered(alias);
+  const firstRoot = join(root, "first");
+  const secondRoot = join(root, "second");
+  await fs.mkdir(firstRoot);
+  await fs.mkdir(secondRoot);
+  const input = { kind: "repository" as const, stateRoot, cwd: firstRoot };
+  expect(await resolveAgentMapProject(input)).toEqual({ kind: "unregistered" });
+  await fs.symlink(firstRoot, alias, "junction");
+  expect(await resolveAgentMapProject(input)).toMatchObject({
+    kind: "resolved",
+    projectId: project.projectId,
+  });
+  await fs.unlink(alias);
+  await fs.symlink(secondRoot, alias, "junction");
+  expect(await resolveAgentMapProject(input)).toEqual({ kind: "unregistered" });
+  expect(
+    await resolveAgentMapProject({ ...input, cwd: secondRoot }),
+  ).toMatchObject({
+    kind: "resolved",
+    projectId: project.projectId,
+  });
+});
+
 it("reports unavailable state for malformed catalogs without rewriting them", async () => {
   await fs.mkdir(stateRoot);
   await fs.writeFile(catalogPath, "broken");
