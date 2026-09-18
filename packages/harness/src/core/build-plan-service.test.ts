@@ -590,6 +590,22 @@ describe("BuildPlanService", () => {
       projectId,
     );
     expect(afterMapEdit.mapVersions).toHaveLength(aggregate.mapVersions.length + 1);
+    expect(afterMapEdit.mapVersions.at(-1)?.graph.nodes).toContainEqual(
+      expect.objectContaining({
+        id: refs.research,
+        purpose: "Expanded research scope",
+      }),
+    );
+    expect(afterMapEdit.mapOperationHistory.at(-1)?.requestId).toBe(
+      "external-map-edit",
+    );
+    expect(afterMapEdit.requestReceipts).toContainEqual(
+      expect.objectContaining({
+        operation: "map",
+        requestId: "external-map-edit",
+        sessionId: "external-map-session",
+      }),
+    );
     expect(afterMapEdit.buildPlanVersions).toEqual(aggregate.buildPlanVersions);
     expect(afterMapEdit.briefVersionsById).toEqual(aggregate.briefVersionsById);
     expect(afterMapEdit.current.buildPlan).toEqual(aggregate.current.buildPlan);

@@ -149,7 +149,7 @@
     "lint": "eslint src --ext .ts",
     "test": "vitest run --passWithNoTests",
     "prepublishOnly": "pnpm build",
-    "test:package": "pnpm build && node scripts/check-package.mjs"
+    "test:package": "node --test scripts/package-boundaries.test.mjs && pnpm build && node scripts/check-package.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.11.30",

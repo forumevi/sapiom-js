@@ -12,6 +12,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import {
+  assertStandaloneBrowserInputs,
+  assertStandaloneDependencies,
+} from "./package-boundaries.mjs";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const pnpm = process.env.npm_execpath;
@@ -53,9 +57,13 @@ try {
       "utf8",
     ),
   );
-  assert(
-    !Object.keys(installed.dependencies).some((name) =>
-      ["@sapiom/harness", "@sapiom/mcp"].includes(name),
+  assertStandaloneDependencies(
+    JSON.parse(
+      execFileSync(
+        process.execPath,
+        [pnpm, "list", "--prod", "--depth", "Infinity", "--json"],
+        { cwd: consumer, encoding: "utf8", windowsHide: true },
+      ),
     ),
   );
   // Import every public browser surface with tree shaking disabled. Node-only
@@ -86,11 +94,7 @@ try {
     treeShaking: false,
     metafile: true,
   });
-  assert(
-    !Object.keys(bundled.metafile.inputs).some((file) =>
-      /packages\/(harness|mcp)\//.test(file),
-    ),
-  );
+  assertStandaloneBrowserInputs(Object.keys(bundled.metafile.inputs));
   await writeFile(
     join(consumer, "check.mjs"),
     `

@@ -43,4 +43,6 @@ Map writes preserve the complete planning aggregate (including plans, briefs, re
 
 Run `pnpm --filter @sapiom/agent-map test:package` after installing dependencies. It packs and installs the library outside the workspace, verifies every export and declaration, bundles all browser exports without tree shaking, and exercises authoring, restart, replay, and project lookup without Studio or MCP installed. Runtime regression suites remain in Harness and import this package.
 
+The check rejects Studio/MCP anywhere in the installed dependency graph, including aliases and optional dependencies, and in both workspace and installed browser bundle paths. Negative fixtures exercise these checks before the tarball smoke test.
+
 Package tests run on Node 18; the repository and Studio CI matrix covers Node 20/22, browser journeys, and Linux packaged Desktop smoke. New MCP tool activation is handled separately from this library.
