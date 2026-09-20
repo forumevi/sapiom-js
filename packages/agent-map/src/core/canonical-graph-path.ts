@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import * as path from "node:path";
 
 const MAX_CACHED_PATHS = 20_000;
@@ -53,12 +53,32 @@ export function rememberCanonicalGraphPath(
  * providers and watcher paths that have not yet been reconciled.
  */
 export function canonicalGraphPath(input: string): string {
-  return resolveCanonicalGraphPath(input, false);
+  return resolveCanonicalGraphPath(input);
 }
 
-/** Refresh identity without a watcher; non-missing filesystem errors propagate. */
-export function refreshCanonicalGraphPath(input: string): string {
-  return resolveCanonicalGraphPath(input, true);
+/** Refresh scope identity without blocking the event loop or hiding I/O errors. */
+export async function refreshCanonicalGraphPath(
+  input: string,
+): Promise<string> {
+  const resolved = normalizedAbsolute(input);
+  if (isWindowsAbsolute(input) !== (process.platform === "win32"))
+    return resolved;
+  const api = pathApi(input);
+  const missing: string[] = [];
+  let ancestor = resolved;
+  for (;;) {
+    try {
+      const result = api.join(await fs.realpath(ancestor), ...missing);
+      rememberCanonicalGraphPath(resolved, result);
+      return result;
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error;
+      const parent = api.dirname(ancestor);
+      if (parent === ancestor) return resolved;
+      missing.unshift(api.basename(ancestor));
+      ancestor = parent;
+    }
+  }
 }
 
 /** Only missing path segments permit reconstructing identity from an ancestor. */
@@ -67,13 +87,13 @@ function isMissingPathError(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
-/** Fresh scope lookup surfaces I/O failures; graph projection stays best effort. */
-function resolveCanonicalGraphPath(input: string, fresh: boolean): string {
+/** Graph projection retains its cached, best-effort filesystem fallback. */
+function resolveCanonicalGraphPath(input: string): string {
   const windows = isWindowsAbsolute(input);
   const api = pathApi(input);
   const resolved = normalizedAbsolute(input);
   const cached = canonicalPaths.get(resolved);
-  if (!fresh && cached !== undefined) {
+  if (cached !== undefined) {
     remember(resolved, cached);
     return cached;
   }
@@ -83,9 +103,7 @@ function resolveCanonicalGraphPath(input: string, fresh: boolean): string {
   try {
     probe?.(resolved);
     result = realpathSync.native(resolved);
-  } catch (error) {
-    // Cached graph projections retain their legacy best-effort fallback.
-    if (fresh && !isMissingPathError(error)) throw error;
+  } catch {
     const missingSegments: string[] = [];
     let ancestor = resolved;
     let parent = api.dirname(ancestor);
@@ -96,8 +114,7 @@ function resolveCanonicalGraphPath(input: string, fresh: boolean): string {
         probe?.(ancestor);
         result = api.join(realpathSync.native(ancestor), ...missingSegments);
         break;
-      } catch (error) {
-        if (fresh && !isMissingPathError(error)) throw error;
+      } catch {
         parent = api.dirname(ancestor);
       }
     }

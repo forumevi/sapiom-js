@@ -1,5 +1,4 @@
-import { realpathSync } from "node:fs";
-import * as fs from "node:fs/promises";
+import { promises as fs, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -26,6 +25,15 @@ async function registered(cwd = join(root, "repo")) {
   return { catalog, project, cwd };
 }
 
+function lookupRepository(cwd: string, projectId?: string) {
+  return resolveAgentMapProject({
+    kind: "repository",
+    stateRoot,
+    cwd,
+    projectId,
+  });
+}
+
 it("resolves trusted host and nested repository to the same existing project and custom state path", async () => {
   const { project, cwd, catalog } = await registered();
   const before = await fs.readFile(catalogPath, "utf8");
@@ -34,11 +42,7 @@ it("resolves trusted host and nested repository to the same existing project and
     stateRoot,
     projectId: project.projectId,
   });
-  const repository = await resolveAgentMapProject({
-    kind: "repository",
-    stateRoot,
-    cwd: join(cwd, "src"),
-  });
+  const repository = await lookupRepository(join(cwd, "src"));
   expect(repository).toEqual(host);
   expect(host).toMatchObject({
     kind: "resolved",
@@ -61,18 +65,12 @@ it("resolves trusted host and nested repository to the same existing project and
 });
 
 it("leaves unknown repositories and absent catalogs untouched", async () => {
-  expect(
-    await resolveAgentMapProject({ kind: "repository", stateRoot, cwd: root }),
-  ).toEqual({ kind: "unregistered" });
+  expect(await lookupRepository(root)).toEqual({ kind: "unregistered" });
   await expect(fs.stat(stateRoot)).rejects.toMatchObject({ code: "ENOENT" });
   const { project } = await registered();
-  expect(
-    await resolveAgentMapProject({
-      kind: "repository",
-      stateRoot,
-      cwd: join(root, "other"),
-    }),
-  ).toEqual({ kind: "unregistered" });
+  expect(await lookupRepository(join(root, "other"))).toEqual({
+    kind: "unregistered",
+  });
   expect(
     await resolveAgentMapProject({
       kind: "host",
@@ -110,29 +108,17 @@ it("preserves identity through symlinks and explicitly registered worktree roots
   await fs.mkdir(cwd);
   const alias = join(root, "alias");
   await fs.symlink(cwd, alias, "junction");
-  expect(
-    await resolveAgentMapProject({
-      kind: "repository",
-      stateRoot,
-      cwd: join(alias, "src"),
-    }),
-  ).toMatchObject({ kind: "resolved", projectId: project.projectId });
+  expect(await lookupRepository(join(alias, "src"))).toMatchObject({
+    kind: "resolved",
+    projectId: project.projectId,
+  });
   const worktree = join(root, "worktree");
-  expect(
-    await resolveAgentMapProject({
-      kind: "repository",
-      stateRoot,
-      cwd: worktree,
-    }),
-  ).toEqual({ kind: "unregistered" });
+  expect(await lookupRepository(worktree)).toEqual({ kind: "unregistered" });
   await catalog.addRootBinding(project.projectId, worktree);
-  expect(
-    await resolveAgentMapProject({
-      kind: "repository",
-      stateRoot,
-      cwd: worktree,
-    }),
-  ).toMatchObject({ kind: "resolved", projectId: project.projectId });
+  expect(await lookupRepository(worktree)).toMatchObject({
+    kind: "resolved",
+    projectId: project.projectId,
+  });
 });
 
 it("reports ambiguous legacy Windows roots and permits an explicit project choice without writes", async () => {
@@ -246,45 +232,91 @@ it("reports unavailable state for malformed catalogs without rewriting them", as
 
 it.each(
   ["EACCES", "EPERM", "EIO", "ELOOP"].flatMap((code) =>
-    ["cwd", "ancestor", "binding"].map((location) => ({ code, location })),
+    ["cwd", "ancestor", "binding", "unrelated"].map((location) => ({
+      code,
+      location,
+    })),
   ),
 )(
-  "reports unavailable for $code at the $location",
+  "isolates $code at the $location and preserves ownership errors",
   async ({ code, location }) => {
-    const { cwd, catalog } = await registered();
-    await fs.mkdir(cwd);
-    const blocked = location === "binding" ? join(root, "blocked") : cwd;
-    if (location === "binding") {
+    const { cwd, catalog, project } = await registered();
+    const nested = join(cwd, "nested");
+    await fs.mkdir(nested, { recursive: true });
+    const blocked = location === "unrelated" ? join(root, "blocked") : cwd;
+    if (location === "unrelated") {
       const second = await catalog.create("Blocked project");
       await catalog.addRootBinding(second.projectId, blocked);
     }
+    const realpath = fs.realpath;
     const native = realpathSync.native;
     vi.spyOn(realpathSync, "native").mockImplementation((path) => {
+      if (path.toString() === blocked)
+        throw Object.assign(new Error("Filesystem unavailable"), { code });
+      return native(path);
+    });
+    vi.spyOn(fs, "realpath").mockImplementation(async (path) => {
       if (path.toString() === blocked) {
         throw Object.assign(new Error("Filesystem unavailable"), { code });
       }
-      return native(path);
+      return realpath(path);
     });
-    expect(
-      await resolveAgentMapProject({
-        kind: "repository",
-        stateRoot,
-        cwd: location === "ancestor" ? join(cwd, "missing") : cwd,
-      }),
-    ).toEqual({ kind: "unavailable" });
+    const target =
+      location === "ancestor"
+        ? join(cwd, "missing")
+        : location === "binding"
+          ? nested
+          : cwd;
+    expect(await lookupRepository(target)).toMatchObject(
+      location === "unrelated"
+        ? { kind: "resolved", projectId: project.projectId }
+        : { kind: "unavailable" },
+    );
+    if (location !== "unrelated") {
+      await expect(
+        catalog.resolveIdentityForPath(target),
+      ).rejects.toMatchObject({ code: "storage_unavailable" });
+    }
   },
 );
 
+it("bounds repeated root probes and refreshes expired successes and failures", async () => {
+  const alias = join(root, "alias");
+  const { catalog, project } = await registered(alias);
+  const cwd = join(root, "repo");
+  const nested = join(cwd, "nested");
+  await fs.mkdir(nested, { recursive: true });
+  await fs.symlink(cwd, alias, "junction");
+  const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+  const realpath = fs.realpath;
+  const probe = vi.spyOn(fs, "realpath");
+  const syncProbe = vi.spyOn(realpathSync, "native");
+  for (let i = 0; i < 3; i++)
+    expect((await catalog.resolveIdentityForPath(nested))?.projectId).toBe(
+      project.projectId,
+    );
+  expect(probe.mock.calls.filter(([path]) => path === alias)).toHaveLength(1);
+  expect(probe.mock.calls.filter(([path]) => path === nested)).toHaveLength(3);
+  expect(syncProbe).not.toHaveBeenCalled();
+  probe.mockImplementation(async (path) => {
+    if (path === alias)
+      throw Object.assign(new Error("Unreadable root"), { code: "EACCES" });
+    return realpath(path);
+  });
+  clock.mockReturnValue(1_000);
+  await expect(catalog.resolveIdentityForPath(nested)).rejects.toMatchObject({
+    code: "storage_unavailable",
+  });
+  probe.mockImplementation(realpath);
+  clock.mockReturnValue(2_000);
+  expect((await catalog.resolveIdentityForPath(nested))?.projectId).toBe(
+    project.projectId,
+  );
+});
+
 it("rejects an invalid explicit selector instead of falling back to cwd", async () => {
   const { cwd } = await registered();
-  expect(
-    await resolveAgentMapProject({
-      kind: "repository",
-      stateRoot,
-      cwd,
-      projectId: "",
-    }),
-  ).toEqual({ kind: "unregistered" });
+  expect(await lookupRepository(cwd, "")).toEqual({ kind: "unregistered" });
 });
 
 it("matches Studio expansion of a tilde-prefixed custom state root", async () => {
