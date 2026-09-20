@@ -359,6 +359,10 @@ export class StudioProjectCatalog {
   private loadPromise: Promise<void> | null = null;
   private mutationQueue: Promise<void> = Promise.resolve();
   private migrationPending = false;
+  private rootPaths = new Map<
+    string,
+    { at: number; cwd: string; unavailable: boolean }
+  >();
 
   constructor(
     private readonly catalogPath: string,
@@ -475,14 +479,15 @@ export class StudioProjectCatalog {
 
   /**
    * Resolves a cwd to the most-specific active durable project root. Local
-   * roots remain private; ambiguous equal-specificity matches fail closed.
+   * roots remain private; ambiguous matches return null, I/O failures throw.
    */
   async resolveIdentityForPath(cwd: string): Promise<ResolvedStudioProjectIdentity | null> {
     const result = await this.lookupIdentityForPath(cwd);
+    if (result.kind === "unavailable") throw storageError();
     return result.kind === "resolved" ? result.project : null;
   }
 
-  /** Unreadable candidate roots make reliable project disambiguation unavailable. */
+  /** Isolate unrelated root failures; share root probes for one second per catalog. */
   async lookupIdentityForPath(
     cwd: string,
     projectId?: StudioProjectId,
@@ -490,20 +495,53 @@ export class StudioProjectCatalog {
     await this.mutationQueue;
     await this.load(true);
     try {
-      const canonical = refreshCanonicalGraphPath(cwd);
-      const match = matchProjectRootForPath(
-        canonical,
+      const canonical = await refreshCanonicalGraphPath(cwd);
+      const activePaths = new Set(this.projects!.flatMap((project) =>
+        project.rootBindings
+          .filter(({ status }) => status === "active")
+          .map(({ localRootRef }) => localRootRef),
+      ));
+      for (const key of this.rootPaths.keys())
+        if (!activePaths.has(key)) this.rootPaths.delete(key);
+      const roots = await Promise.all(
         this.projects!
           .filter((project) => !projectId || project.projectId === projectId)
           .flatMap((project) =>
             project.rootBindings
               .filter(({ status }) => status === "active")
-              .map((binding) => ({
-                projectId: project.projectId,
-                cwd: refreshCanonicalGraphPath(binding.localRootRef),
-                project,
-              })),
+              .map(async (binding) => {
+                const previous = this.rootPaths.get(binding.localRootRef);
+                let value = previous;
+                if (!value || Date.now() < value.at || Date.now() - value.at >= 1_000) {
+                  try {
+                    const cwd = await refreshCanonicalGraphPath(binding.localRootRef);
+                    value = { cwd, unavailable: false, at: Date.now() };
+                  } catch {
+                    value = {
+                      cwd: previous?.cwd ?? binding.localRootRef,
+                      unavailable: true,
+                      at: Date.now(),
+                    };
+                  }
+                  this.rootPaths.set(binding.localRootRef, value);
+                }
+                return {
+                  ...value, localRootRef: binding.localRootRef,
+                  projectId: project.projectId, project,
+                };
+              }),
           ),
+      );
+      const failed = roots
+        .filter((root) => root.unavailable)
+        .flatMap((root) => [root, { ...root, cwd: root.localRootRef }]);
+      if ([cwd, canonical].some((target) =>
+        matchProjectRootForPath(target, failed).kind !== "unregistered",
+      )) {
+        return { kind: "unavailable" };
+      }
+      const match = matchProjectRootForPath(
+        canonical, roots.filter((root) => !root.unavailable),
       );
       if (match.kind !== "resolved") return match;
       const project = match.root.project;

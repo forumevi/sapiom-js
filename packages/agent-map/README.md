@@ -29,9 +29,9 @@ Results are `resolved`, `unregistered`, `ambiguous`, or `unavailable`. A resolve
 
 Lookup is side-effect-free: it never registers a project or creates a map. Storage remains `<stateRoot>/agent-map/projects/<projectId>/workspace.json`; the default state root is `~/.sapiom/harness`.
 
-Repository lookups refresh filesystem identity for both the working directory and catalog roots, including symlinks created or retargeted since a previous lookup. The browser-safe `@sapiom/agent-map/project-roots` matcher normalizes `.` and `..` lexically before containment and depth comparison; hosts must resolve symlinks before calling it directly.
+Repository lookups refresh working-directory identity asynchronously on every call. Each catalog instance caches root probes for at most one second, including failed probes, so repeated session/restore lookups avoid scanning every root again. Root symlink changes are visible after that interval; standalone resolution creates a fresh catalog. The browser-safe `@sapiom/agent-map/project-roots` matcher normalizes `.` and `..` lexically before containment and depth comparison; hosts must resolve symlinks before calling it directly.
 
-Missing descendants can resolve through their nearest existing ancestor. Permission failures, symlink loops, and other filesystem errors produce `unavailable`, including errors reading candidate catalog roots.
+Missing descendants can resolve through their nearest existing ancestor. Permission failures, symlink loops, and other filesystem errors produce `unavailable` for the working directory or a root whose lexical or last-known canonical path contains it. Unreadable unrelated roots are skipped. The Studio compatibility method `resolveIdentityForPath` throws `storage_unavailable` for these failures so callers cannot treat uncertain ownership as unregistered.
 
 Studio owns discovery and calls the shared catalog's `reconcile` with the complete root inventory. A standalone lookup must never call `reconcile([cwd])`, which would mark other roots missing. Explicit registration uses catalog `create`/`addRootBinding` methods under the existing catalog lock; additional roots must be registered to reuse a project across worktrees.
 
