@@ -38,10 +38,22 @@ const DEFAULT_BASE_URL = resolveServiceUrl(
 // ----- Types -----
 
 /**
- * Lifetime of a session's `liveViewUrl`. `"persistent"` means the link works for as long as
- * the session does.
+ * Lifetime of a session's `liveViewUrl`. `"persistent"` works for as long as the session does.
  */
 export type LiveViewMode = "persistent";
+
+/**
+ * Session lifetime in integer minutes. Omitted values use the gateway defaults: 5 minutes
+ * idle timeout and 20 minutes maximum duration. Idle timeout accepts 1–60 minutes and max
+ * duration accepts 1–240 minutes; out-of-range values are rejected by the gateway with HTTP
+ * 400. The idle timer starts only after all CDP/live-view clients disconnect. Reconnecting
+ * resets idle but never extends maximum duration. For example, idle 30 / max 20 ends at 20
+ * minutes regardless.
+ */
+export interface SessionTimeoutOptions {
+  idleTimeoutMinutes?: number;
+  maxDurationMinutes?: number;
+}
 
 export interface BrowserSession {
   /** Unique session identifier. */
@@ -54,8 +66,10 @@ export interface BrowserSession {
    * a one-time code, a payment confirmation. They act inside the same session, and the agent
    * resumes over `cdpUrl` with cookies intact.
    *
-   * The link works for as long as the session does (see `expiresAt` / `maxDurationSec`) and
-   * anyone holding it can act in the browser. Treat it like a credential: send it to one
+   * The link works for as long as the session does (see `maxDurationSec`).
+   * Current gateways return `liveViewMode: "persistent"`; older gateways omit the field.
+   * Single-use live views are not supported. Anyone holding the link can act in the browser.
+   * Treat it like a credential: send it to one
    * person over a channel you trust, and close the session when the step is done.
    * Absent from Local Run stub sessions.
    *
@@ -64,10 +78,17 @@ export interface BrowserSession {
   liveViewUrl?: string;
   /** Lifetime the capability applied to `liveViewUrl`; see {@link LiveViewMode}. */
   liveViewMode?: LiveViewMode;
-  /** ISO-8601 timestamp when this session expires. */
+  /**
+   * ISO-8601 expiry of the gateway payment context. This includes a settlement buffer;
+   * it is not a browser liveness deadline. See `maxDurationSec` for the browser limit.
+   */
   expiresAt: string;
   /** Maximum session duration in seconds. */
   maxDurationSec: number;
+  /** Applied idle timeout in minutes, when returned by the gateway. */
+  idleTimeoutMinutes?: number;
+  /** Applied maximum duration in minutes, when returned by the gateway. */
+  maxDurationMinutes?: number;
   /** Additional fields returned by the capability, passed through as-is. */
   [k: string]: unknown;
 }
@@ -163,7 +184,7 @@ export interface Identity {
   [k: string]: unknown;
 }
 
-export interface WithSessionOptions {
+export interface WithSessionOptions extends SessionTimeoutOptions {
   /**
    * When provided, opens the session with the given identity so it starts with
    * a pre-authenticated browser context.
@@ -200,6 +221,10 @@ interface RawBrowserSession {
   expiresAt?: string;
   max_duration_sec?: number;
   maxDurationSec?: number;
+  idle_timeout_minutes?: number;
+  idleTimeoutMinutes?: number;
+  max_duration_minutes?: number;
+  maxDurationMinutes?: number;
   [k: string]: unknown;
 }
 
@@ -244,6 +269,10 @@ function mapBrowserSession(raw: RawBrowserSession): BrowserSession {
     expiresAt,
     max_duration_sec,
     maxDurationSec,
+    idle_timeout_minutes,
+    idleTimeoutMinutes,
+    max_duration_minutes,
+    maxDurationMinutes,
     ...rest
   } = raw;
   const resolvedLiveViewUrl = liveViewUrl ?? live_view_url;
@@ -259,6 +288,12 @@ function mapBrowserSession(raw: RawBrowserSession): BrowserSession {
     }),
     expiresAt: (expiresAt ?? expires_at ?? "") as string,
     maxDurationSec: (maxDurationSec ?? max_duration_sec ?? 0) as number,
+    ...((idleTimeoutMinutes ?? idle_timeout_minutes) !== undefined && {
+      idleTimeoutMinutes: idleTimeoutMinutes ?? idle_timeout_minutes,
+    }),
+    ...((maxDurationMinutes ?? max_duration_minutes) !== undefined && {
+      maxDurationMinutes: maxDurationMinutes ?? max_duration_minutes,
+    }),
     ...rest,
   };
 }
@@ -348,22 +383,63 @@ function assertUrl(url: unknown): void {
 
 /**
  * Open a new browser session. Returns a `BrowserSession` with a CDP WebSocket
- * you can pass to Playwright or Puppeteer. The session is billed at `upto $1.00`;
- * call `sessions.close` (or use `withSession`) to settle the exact cost.
+ * you can pass to Playwright or Puppeteer. The gateway authorizes $1 per started hour of
+ * the requested maximum duration ($1 by default, up to $4 for 240 minutes). This is a payment
+ * authorization, not a provider usage limit. Call `sessions.close` (or use `withSession`)
+ * when finished to request settlement of actual usage.
  * Failed requests throw {@link BrowserAutomationHttpError}.
  */
+export function createSession(
+  options?: SessionTimeoutOptions,
+  transport?: Transport,
+  baseUrl?: string,
+): Promise<BrowserSession>;
+export function createSession(
+  transport: Transport,
+  baseUrl?: string,
+): Promise<BrowserSession>;
+export function createSession(
+  transport: Transport | undefined,
+  baseUrl?: string,
+): Promise<BrowserSession>;
 export async function createSession(
-  transport: Transport = defaultTransport(),
+  optionsOrTransport?: SessionTimeoutOptions | Transport,
+  transportOrBaseUrl?: Transport | string,
   baseUrl = DEFAULT_BASE_URL,
 ): Promise<BrowserSession> {
+  const isTransport = (value: unknown): value is Transport =>
+    typeof value === "object" && value !== null && "fetch" in value;
+  const transport = isTransport(optionsOrTransport)
+    ? optionsOrTransport
+    : isTransport(transportOrBaseUrl)
+      ? transportOrBaseUrl
+      : defaultTransport();
+  const isLegacyCall =
+    isTransport(optionsOrTransport) ||
+    (optionsOrTransport === undefined &&
+      typeof transportOrBaseUrl === "string");
+  const resolvedBaseUrl = isLegacyCall
+    ? typeof transportOrBaseUrl === "string"
+      ? transportOrBaseUrl
+      : DEFAULT_BASE_URL
+    : baseUrl;
+  const options = isLegacyCall ? undefined : optionsOrTransport;
+  const body = {
+    ...(options?.idleTimeoutMinutes !== undefined && {
+      idleTimeoutMinutes: options.idleTimeoutMinutes,
+    }),
+    ...(options?.maxDurationMinutes !== undefined && {
+      maxDurationMinutes: options.maxDurationMinutes,
+    }),
+  };
   const res = await ensureOk(
-    await transport.fetch(`${baseUrl}/v1/sessions`, {
+    await transport.fetch(`${resolvedBaseUrl}/v1/sessions`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         accept: "application/json",
       },
-      body: JSON.stringify({}),
+      body: JSON.stringify(body),
     }),
     "Failed to create session",
   );
@@ -376,7 +452,7 @@ export async function createSession(
  * {@link BrowserAutomationHttpError}.
  */
 export async function createSessionWithIdentity(
-  input: { identityId: string },
+  input: { identityId: string } & SessionTimeoutOptions,
   transport: Transport = defaultTransport(),
   baseUrl = DEFAULT_BASE_URL,
 ): Promise<BrowserSession> {
@@ -389,7 +465,15 @@ export async function createSessionWithIdentity(
         "content-type": "application/json",
         accept: "application/json",
       },
-      body: JSON.stringify({ identityId: input.identityId }),
+      body: JSON.stringify({
+        identityId: input.identityId,
+        ...(input.idleTimeoutMinutes !== undefined && {
+          idleTimeoutMinutes: input.idleTimeoutMinutes,
+        }),
+        ...(input.maxDurationMinutes !== undefined && {
+          maxDurationMinutes: input.maxDurationMinutes,
+        }),
+      }),
     }),
     "Failed to create session with identity",
   );
@@ -398,9 +482,9 @@ export async function createSessionWithIdentity(
 
 /**
  * Close a session and settle its billing. Returns a `SessionSettlement` with
- * `capturedAmountUsd` (the exact amount charged, never more than $1.00) and
- * `creditsUsed`. Always call this or use `withSession` to avoid the auto-expiry
- * $1.00 ceiling. Failed requests throw {@link BrowserAutomationHttpError}.
+ * `capturedAmountUsd` (the amount captured on successful settlement) and `creditsUsed`.
+ * Settlement can fail if usage exceeds the payment authorization. Session expiry does not
+ * guarantee settlement. Failed requests throw {@link BrowserAutomationHttpError}.
  */
 export async function closeSession(
   sessionId: string,
@@ -506,12 +590,12 @@ export async function createIdentity(
 
 /**
  * Open a browser session, invoke `fn` with an `ActiveSession` (which includes a
- * session-bound `screenshot` convenience), and **always** close the session in a
+ * session-bound `screenshot` convenience), and attempt to close the session in a
  * `finally` block — even when `fn` throws.
  *
- * This is the recommended way to run a browser automation task: it prevents the
- * session from leaking at the $1.00 ceiling charge if you forget to close it.
- * Failed requests throw {@link BrowserAutomationHttpError}.
+ * Close errors are suppressed to preserve the callback result or error. Use
+ * `sessions.close` directly when your code must check settlement success.
+ * Other failed requests throw {@link BrowserAutomationHttpError}.
  *
  * @example
  * const result = await sapiom.browserAutomation.withSession(async (session) => {
@@ -527,11 +611,15 @@ export async function withSession<T>(
 ): Promise<T> {
   const browserSession = opts?.identityId
     ? await createSessionWithIdentity(
-        { identityId: opts.identityId },
+        {
+          identityId: opts.identityId,
+          idleTimeoutMinutes: opts.idleTimeoutMinutes,
+          maxDurationMinutes: opts.maxDurationMinutes,
+        },
         transport,
         baseUrl,
       )
-    : await createSession(transport, baseUrl);
+    : await createSession(opts, transport, baseUrl);
 
   const activeSession: ActiveSession = {
     ...browserSession,
