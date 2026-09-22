@@ -91,6 +91,11 @@ import { TooltipLayer } from "./components/TooltipLayer";
 import { NewSessionComposer } from "./components/NewSessionComposer";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { CreateAgentDialog } from "./components/CreateAgentDialog";
+import {
+  ProjectFolderDialog,
+  type ProjectFolderIntent,
+} from "./components/ProjectFolderDialog";
+import { chooseProjectFolder } from "./lib/folder-step";
 import { OverviewModal } from "./components/OverviewModal";
 import { WorkflowsRail } from "./components/WorkflowsRail";
 import { boundWorkflowPathOf, createApi, errorMessage } from "./lib/api";
@@ -302,6 +307,16 @@ const HELD_PROMPT_TIMEOUT_MS = 10 * 60_000;
  */
 const HELD_PROMPT_HINT_DELAY_MS = 4_000;
 
+/** Where the new-agent screen is creating, as the rail labels it. */
+interface ComposerProject {
+  root: string;
+  label: string;
+  /** The durable Studio project id, when the server has minted one. */
+  projectId: StudioProjectId | null;
+  /** The template the screen opens with as its idea, if Use brought us here. */
+  template: StudioTemplate | null;
+}
+
 interface CreateSessionAtOptions {
   initialPrompt?: CreateSessionRequest["initialPrompt"];
   initialAttachments?: CreateSessionRequest["initialAttachments"];
@@ -413,6 +428,36 @@ export const App = (): JSX.Element => {
   // explicit Create-new intent or a submission from the automatic home.
   // The home also shows whenever nothing else claims the centre pane.
   const [composing, setComposing] = useState(false);
+  /**
+   * THE PROJECT THE NEW-AGENT SCREEN IS CREATING IN (flow-creation.md §4.3).
+   *
+   * Both entrances set it: New project after its folder step, and a project
+   * row's New agent. The screen STATES it, never asks for it; the folder was
+   * chosen before the screen opened. A template carried here is the idea the
+   * screen opens with (template Use routes through this screen, CF-D11).
+   */
+  const [composerProject, setComposerProject] = useState<ComposerProject | null>(
+    null,
+  );
+  // The stated project lives exactly as long as the scoped screen does. Every
+  // exit (submit, Back, opening a session or a map) ends with `composing`
+  // false, and the automatic home that may show afterwards must not inherit a
+  // project nobody chose for it: its submit would create there.
+  useEffect(() => {
+    if (!composing) setComposerProject(null);
+  }, [composing]);
+  /**
+   * The web half of the folder step, while it is open. Desktop never sets it:
+   * the bridge's `chooseDirectory` answers the question directly (D29). What
+   * happens after the folder is the intent's: New project continues to the
+   * new-agent screen, Add project stops once the folder is in the rail.
+   */
+  const [folderPrompt, setFolderPrompt] = useState<{
+    intent: ProjectFolderIntent;
+    template: StudioTemplate | null;
+    /** The control that ran the step, so Escape hands focus back to it. */
+    trigger: HTMLElement | null;
+  } | null>(null);
   // The tab + is a one-at-a-time create/bind transaction. State renders the
   // pending affordance; the ref closes React's same-frame double-click window.
   const [siblingSessionPending, setSiblingSessionPending] = useState(false);
@@ -445,6 +490,9 @@ export const App = (): JSX.Element => {
   );
   const restoredStudioProjectsRef = useRef(new Set<string>());
   const studioRestoreGenerationRef = useRef(0);
+  // True while openProjectIntoRail awaits the server. The restoration effect
+  // below yields to that open rather than bumping the generation it holds.
+  const projectOpenInFlightRef = useRef(false);
   const effectiveStudioSelection = effectiveStudioWorkspaceSelection(
     studioSelection,
     harness.state,
@@ -494,6 +542,11 @@ export const App = (): JSX.Element => {
     if (
       !state?.studioProjects || !active || selectedProject || studioSelection
     ) return;
+    // openProject refreshes identities before it resolves. If the active
+    // session now falls under the folder being opened, this effect would
+    // restore it and bump the generation, making that open reject its own
+    // result and skip the new-agent screen. The open restores its own project.
+    if (projectOpenInFlightRef.current) return;
     const identityProjectId = active.agentMapIdentity?.projectId ?? null;
     const identityProject = identityProjectId
       ? state.studioProjects.find(
@@ -1110,10 +1163,26 @@ export const App = (): JSX.Element => {
   // while the scaffold path used whatever the user typed, so "where did my
   // project go?" had two answers. Precedence is
   // setting → host default → launch dir (see resolveProjectRoot).
+  //
+  // NO DEFAULT DESTINATION ON DESKTOP (flow-creation.md Q8). That host no
+  // longer passes `projects/`, so the server reports its launchDir as the host
+  // default, and the desktop's launchDir is the harness's own state store
+  // (`~/.sapiom/harness`). A new agent never lands beside `settings.json`:
+  // with no saved setting and no stated project there is nowhere to create,
+  // and the composer says so.
+  const launchDirIsHostDefault =
+    getDesktopBridge() !== null &&
+    !!harness.state?.launchDir &&
+    samePath(
+      harness.state.defaultProjectRoot ?? harness.state.launchDir,
+      harness.state.launchDir,
+    );
   const projectRoot = resolveProjectRoot({
     settingsRoot: harness.settings?.projectRoot,
-    defaultProjectRoot: harness.state?.defaultProjectRoot,
-    launchDir: harness.state?.launchDir,
+    defaultProjectRoot: launchDirIsHostDefault
+      ? null
+      : harness.state?.defaultProjectRoot,
+    launchDir: launchDirIsHostDefault ? null : harness.state?.launchDir,
   });
 
   const saveProjectRoot = async (root: string): Promise<void> => {
@@ -2059,21 +2128,190 @@ export const App = (): JSX.Element => {
   };
 
   /**
-   * THE IN-PROJECT CREATE (SAP-2981; design.md § E4).
+   * OPEN A FOLDER AS A PROJECT and land on it (the rail's Add project, the
+   * folder step's second half). The server mints the durable Studio project
+   * and its agents scan in; the folder stays in the rail with none. No session
+   * is created and no seeding turn runs (flow-creation.md §4.1 step 3, Q5).
    *
-   * The `+` on a project row used to start a session and inject an English
-   * sentence asking the coding agent to please call the scaffold MCP tool. The
-   * harness does it now: the dialog collects a name and a starter, the endpoint
-   * creates the directory and rescans it, and only THEN does a session open.
+   * Returns the project as the rail labels it, so New project can continue to
+   * the new-agent screen scoped to exactly what was opened.
+   */
+  const openProjectIntoRail = async (
+    requestedRoot: string,
+  ): Promise<ComposerProject | null> => {
+    projectOpenInFlightRef.current = true;
+    try {
+      return await openProjectIntoRailUnguarded(requestedRoot);
+    } finally {
+      projectOpenInFlightRef.current = false;
+    }
+  };
+  const openProjectIntoRailUnguarded = async (
+    requestedRoot: string,
+  ): Promise<ComposerProject | null> => {
+    // This operation's generation, taken BEFORE the first await: any
+    // navigation while the open is pending bumps the ref, and a stale open
+    // must neither select anything nor land on the screen. Null means stale.
+    const generation = ++studioRestoreGenerationRef.current;
+    const stale = (): boolean => generation !== studioRestoreGenerationRef.current;
+    const openedRoot = await harness.openProject(requestedRoot);
+    if (stale()) return null;
+    const opened: ComposerProject = {
+      root: openedRoot,
+      label: basenameOf(openedRoot) || openedRoot,
+      projectId: null,
+      template: null,
+    };
+    let restoringProject: {
+      projectId: StudioProjectId;
+      cwd: string;
+    } | null = null;
+    try {
+      const refreshed = await harness.api.getState();
+      if (stale()) return null;
+      const scope = refreshed.workspaceScopes?.find((candidate) =>
+        samePath(candidate.cwd, openedRoot),
+      );
+      const project = refreshed.studioProjects?.find(
+        (candidate) => candidate.projectId === scope?.projectId,
+      );
+      if (!scope?.projectId || !project) return opened;
+      opened.projectId = project.projectId;
+      opened.label = project.displayName || opened.label;
+      restoringProject = {
+        projectId: project.projectId,
+        cwd: scope.cwd,
+      };
+      restoredStudioProjectsRef.current.add(project.projectId);
+      const current = await harness.api.getStudioCurrentWorkspace(
+        project.projectId,
+      );
+      if (stale()) return null;
+      const restoredSelection = current.selection;
+      if (restoredSelection.kind === "agent") {
+        const workflow = refreshed.workflows.find((candidate) =>
+          candidate.studioBindings?.some(
+            (binding) =>
+              binding.projectId === restoredSelection.projectId &&
+              binding.agentId === restoredSelection.agentId,
+          ),
+        );
+        if (workflow) {
+          setStudioSelection(restoredSelection);
+          setSelectedProject(null);
+          setFocusedAgentPath(workflow.path);
+          return opened;
+        }
+      }
+      setStudioSelection({
+        kind: "agent-map",
+        projectId: project.projectId,
+      });
+      setSelectedProject(null);
+      setFocusedAgentPath(scope.cwd);
+      if (isMobile) setRightCollapsed(true);
+    } catch {
+      if (stale()) return null;
+      if (restoringProject) {
+        // Preference restoration is best-effort. The project itself opened
+        // successfully, so fall back to its stable map rather than leaving
+        // the previous workspace selected. The generation taken above is the
+        // restore guard, so later session frames cannot repeat it.
+        setStudioSelection({
+          kind: "agent-map",
+          projectId: restoringProject.projectId,
+        });
+        setSelectedProject(null);
+        setFocusedAgentPath(restoringProject.cwd);
+        if (isMobile) setRightCollapsed(true);
+      }
+    }
+    return opened;
+  };
+
+  /**
+   * LAND ON THE NEW-AGENT SCREEN, scoped to a project (flow-creation.md §4.3).
    *
-   * The order is the feature. Creation completes before the chat starts, so a
-   * failure is a sentence in the dialog rather than a confused model, and the
-   * agent is a row in the rail before anything can ask "did it work?".
-   *
-   * The project is not asked for — it is the row that was clicked.
+   * One screen, every entrance: New project after its folder step, a project
+   * row's New agent, an empty project's name (D36), and template Use. The
+   * project is stated on the screen, never chosen there. No right pane: there
+   * is nothing to project until submit, so the map selection is cleared and the
+   * rail keeps the project's row where it was.
+   */
+  const composeInProject = (project: ComposerProject): void => {
+    studioRestoreGenerationRef.current += 1;
+    setCreatingAgent(null);
+    setStudioSelection(null);
+    setSelectedProject(null);
+    setFocusedAgentPath(project.root);
+    setReviewSummary(null);
+    setTemplatesOpen(false);
+    setOverviewOpen(false);
+    setComposerProject(project);
+    setComposing(true);
+    closeMobileDrawer();
+  };
+
+  /**
+   * THE FOLDER STEP'S ANSWER. The folder opens as a project either way; only
+   * New project continues to the screen. Rejects with the sentence the web
+   * dialog shows; the desktop path toasts it.
+   */
+  const handleProjectFolderChosen = async (
+    root: string,
+    intent: ProjectFolderIntent,
+    template: StudioTemplate | null,
+  ): Promise<void> => {
+    const opened = await openProjectIntoRail(root);
+    // A newer navigation won while the folder opened: it decided where the
+    // user is, and a late folder choice does not replace that.
+    if (!opened) return;
+    if (intent === "new-project") composeInProject({ ...opened, template });
+  };
+
+  /**
+   * THE FOLDER STEP (flow-creation.md §4.1 step 2, D29). The desktop bridge's
+   * picker directly, with no Studio dialog in front of it and no pre-chosen
+   * parent (Q8); the one-field dialog only where there is no bridge. Cancel
+   * returns the user to where they were: nothing opens, nothing is remembered.
+   */
+  const runFolderStep = (
+    intent: ProjectFolderIntent,
+    template: StudioTemplate | null = null,
+  ): void => {
+    // The control that asked is the one focus returns to when the web dialog
+    // closes; captured here because more than one surface runs this step.
+    const trigger =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    void chooseProjectFolder({
+      chooseDirectory: getDesktopBridge()?.chooseDirectory ?? null,
+      startingAt: null,
+      openDialog: () => setFolderPrompt({ intent, template, trigger }),
+      onPicked: (root) => {
+        void handleProjectFolderChosen(root, intent, template).catch(
+          (err: unknown) => {
+            harness.showToast(errorMessage(err, "Couldn't open that folder."));
+          },
+        );
+      },
+      onError: (message) => harness.showToast(message),
+    });
+  };
+  const handleNewProject = (): void => runFolderStep("new-project");
+  const handleAddProject = (): void => runFolderStep("add-project");
+
+  /**
+   * NEW AGENT IN A PROJECT YOU ALREADY HAVE (flow-creation.md §4.2, D33, D34).
+   * The row that was pressed is the answer to "where"; the screen opens
+   * scoped to it and asks only for the idea.
    */
   const handleCreateAgentInProject = (root: string, label: string): void => {
-    setCreatingAgent({ root, label });
+    const projectId =
+      workspaceScopes.find((scope) => samePath(scope.cwd, root))?.projectId ??
+      null;
+    composeInProject({ root, label, projectId, template: null });
   };
 
   const createAgentInProject = async (input: {
@@ -2354,24 +2592,34 @@ export const App = (): JSX.Element => {
   };
 
   // The composer home's two on-ramps. Both open a session in a FRESH project
-  // folder under the project root (deduped so an existing folder is never
-  // clobbered) and open the workbench terminal-only — the canvas reveals itself
-  // once the agent generates content (see CanvasPane's onCanvasState below).
-  const uniqueProjectDir = (base: string): string => {
+  // folder (deduped so an existing folder is never clobbered) and open the
+  // workbench terminal-only — the canvas reveals itself once the agent
+  // generates content (see CanvasPane's onCanvasState below).
+  //
+  // The folder is the STATED project's (flow-creation.md §4.3): the screen
+  // names one and the request creates in it. Only the no-project home falls
+  // back to the project root. Each caller passes its own root, so a project
+  // the screen stated earlier never decides where an unrelated clone lands.
+  // Slice 4 (SAP-3576) replaces this path with the scaffold endpoint; until
+  // then the destination and the label agree.
+  const uniqueProjectDir = (base: string, root: string | null): string => {
+    // Collisions are local to the destination: only its direct children are
+    // taken, so a same-named agent in another project costs no suffix here.
     const taken = new Set<string>();
-    for (const session of state.sessions) {
-      const name = basenameOf(session.cwd);
-      if (name) taken.add(name);
+    if (root) {
+      for (const dir of [
+        ...state.sessions.map((session) => session.cwd),
+        ...state.workflows.map((workflow) => workflow.path),
+      ]) {
+        const parent = parentOf(dir);
+        if (parent && samePath(parent, root)) taken.add(basenameOf(dir));
+      }
     }
-    for (const workflow of state.workflows) {
-      const name = basenameOf(workflow.path);
-      if (name) taken.add(name);
-    }
-    return projectDirSuggestion(
-      nextAvailableName(base, taken),
-      projectRoot || null,
-    );
+    return projectDirSuggestion(nextAvailableName(base, taken), root);
   };
+  /** Where the composer creates: the stated project, else the project root. */
+  const composerRoot = (): string | null =>
+    composerProject?.root ?? (projectRoot || null);
 
   const handleComposerSubmitIdea = async (
     idea: string,
@@ -2379,9 +2627,10 @@ export const App = (): JSX.Element => {
   ): Promise<void> => {
     const cwd = uniqueProjectDir(
       idea.trim() ? slugifyIdea(idea) : FALLBACK_PROJECT_NAME,
+      composerRoot(),
     );
     if (!cwd) {
-      throw new Error("Set a project folder first — use the + to open one.");
+      throw new Error("Choose a project first: New project picks its folder.");
     }
     // Terminal-first: the new session's canvas slides in once it paints.
     setRightCollapsed(true);
@@ -2402,9 +2651,9 @@ export const App = (): JSX.Element => {
   };
 
   const handleComposerUseTemplate = (template: GalleryTemplate): void => {
-    const cwd = uniqueProjectDir(template.id);
+    const cwd = uniqueProjectDir(template.id, composerRoot());
     if (!cwd) {
-      harness.showToast("Set a project folder first — use the + to open one.");
+      harness.showToast("Choose a project first: New project picks its folder.");
       return;
     }
     setRightCollapsed(true);
@@ -2674,11 +2923,14 @@ export const App = (): JSX.Element => {
     target: DeepLinkAgentTarget,
   ): Promise<void> => {
     setCloneRequest(null);
+    // The global root, never a project the screen stated earlier: no screen
+    // names a project for a deep-linked clone.
     const cwd = uniqueProjectDir(
       target.slug?.trim() || `agent-${target.definitionId}`,
+      projectRoot || null,
     );
     if (!cwd) {
-      harness.showToast("Set a project folder first — use the + to open one.");
+      harness.showToast("Choose a project first: New project picks its folder.");
       return;
     }
     pendingCloneFocusRef.current = target.definitionId;
@@ -2953,8 +3205,6 @@ export const App = (): JSX.Element => {
         >
           <WorkflowsRail
             assistant={harness.assistant}
-            projectRoot={projectRoot || null}
-            onSaveProjectRoot={saveProjectRoot}
             width={widths.rail}
             minWidth={RAIL_MIN}
             workflows={state.workflows}
@@ -2972,9 +3222,6 @@ export const App = (): JSX.Element => {
             }
             onFocusAgent={handleFocusAgent}
             onOpenPalette={() => setPaletteOpen(true)}
-            onConnect={async (path) => {
-              await harness.connectWorkflow(path);
-            }}
             onCollapse={() => setRailCollapsed(true)}
             canGoBack={navHistory.canGoBack}
             canGoForward={navHistory.canGoForward}
@@ -2992,14 +3239,8 @@ export const App = (): JSX.Element => {
               setTemplatesOpen(false);
               closeMobileDrawer();
             }}
-            onNewSession={() => {
-              studioRestoreGenerationRef.current += 1;
-              setStudioSelection(null);
-              setSelectedProject(null);
-              setComposing(true);
-              setTemplatesOpen(false);
-              setOverviewOpen(false);
-            }}
+            onNewProject={handleNewProject}
+            onAddProject={handleAddProject}
             onReviewSummary={reviewPastSession}
             history={harness.history}
             historyLoading={harness.historyLoading}
@@ -3020,74 +3261,7 @@ export const App = (): JSX.Element => {
               }
               await harness.removeProject(root);
             }}
-            onOpenProject={async (requestedRoot) => {
-              const openedRoot = await harness.openProject(requestedRoot);
-              let restoringProject: {
-                projectId: StudioProjectId;
-                cwd: string;
-              } | null = null;
-              try {
-                const refreshed = await harness.api.getState();
-                const scope = refreshed.workspaceScopes?.find((candidate) =>
-                  samePath(candidate.cwd, openedRoot),
-                );
-                const project = refreshed.studioProjects?.find(
-                  (candidate) => candidate.projectId === scope?.projectId,
-                );
-                if (!scope?.projectId || !project) return;
-                restoringProject = {
-                  projectId: project.projectId,
-                  cwd: scope.cwd,
-                };
-                restoredStudioProjectsRef.current.add(project.projectId);
-                const generation = ++studioRestoreGenerationRef.current;
-                const current = await harness.api.getStudioCurrentWorkspace(
-                  project.projectId,
-                );
-                if (generation !== studioRestoreGenerationRef.current) return;
-                const restoredSelection = current.selection;
-                if (restoredSelection.kind === "agent") {
-                  const workflow = refreshed.workflows.find((candidate) =>
-                    candidate.studioBindings?.some(
-                      (binding) =>
-                        binding.projectId === restoredSelection.projectId &&
-                        binding.agentId === restoredSelection.agentId,
-                    ),
-                  );
-                  if (workflow) {
-                    setStudioSelection(restoredSelection);
-                    setSelectedProject(null);
-                    setFocusedAgentPath(workflow.path);
-                    return;
-                  }
-                }
-                setStudioSelection({
-                  kind: "agent-map",
-                  projectId: project.projectId,
-                });
-                setSelectedProject(null);
-                setFocusedAgentPath(scope.cwd);
-                if (isMobile) setRightCollapsed(true);
-              } catch {
-                if (restoringProject) {
-                  // Preference restoration is best-effort. The project itself
-                  // opened successfully, so fall back to its stable map rather
-                  // than leaving the previous workspace selected. Keep the
-                  // restore guard so later session frames cannot repeat it.
-                  studioRestoreGenerationRef.current += 1;
-                  setStudioSelection({
-                    kind: "agent-map",
-                    projectId: restoringProject.projectId,
-                  });
-                  setSelectedProject(null);
-                  setFocusedAgentPath(restoringProject.cwd);
-                  if (isMobile) setRightCollapsed(true);
-                }
-              }
-            }}
-            launchDir={state.launchDir ?? null}
-            listDir={harness.listDir}
-            listHarnesses={harness.listHarnesses}
+            onOpenProject={openProjectIntoRail}
             onCreateAgent={handleCreateAgentInProject}
             onScaffoldInSession={handleScaffoldInSession}
             onBrowseTemplates={() => {
@@ -3098,7 +3272,6 @@ export const App = (): JSX.Element => {
               setOverviewOpen(false);
             }}
             templatesActive={templatesOpen}
-            onScanWorkflows={handleScanWorkflows}
             onToast={harness.showToast}
             telemetryOptIn={
               harness.settings?.telemetryOptIn ?? state.telemetryOptIn
@@ -3508,6 +3681,7 @@ export const App = (): JSX.Element => {
                    screen gives way to the terminal (createSessionAt clears
                    `composing`), and the canvas reveals itself once populated. */
                 <NewSessionComposer
+                  project={composerProject}
                   harness={selectedHarness}
                   entries={harnessEntries ?? FALLBACK_HARNESSES}
                   onHarnessChange={setSelectedHarness}
@@ -3973,6 +4147,26 @@ export const App = (): JSX.Element => {
             setTemplatesOpen(true);
           }}
           onDismiss={() => setOverviewOpen(false)}
+        />
+      )}
+
+      {/* The web half of the folder step (D29). Mounted beside the other
+          cards-on-top: it outlives the rail control that asked for it, and it
+          is the same dialog whichever surface ran the step. */}
+      {folderPrompt && (
+        <ProjectFolderDialog
+          intent={folderPrompt.intent}
+          initialPath=""
+          listDir={harness.listDir}
+          triggerRef={{ current: folderPrompt.trigger }}
+          onClose={() => setFolderPrompt(null)}
+          onChoose={(root) =>
+            handleProjectFolderChosen(
+              root,
+              folderPrompt.intent,
+              folderPrompt.template,
+            )
+          }
         />
       )}
 
