@@ -718,7 +718,8 @@ const res = await ctx.sapiom.llm.run({
   request: {
     system,
     messages: [{ role: "user", content: prompt }],
-    max_tokens: 500,
+    // Thinking is spent from this budget too — size it for thinking + output.
+    max_tokens: 4096,
   },
   output: { name: REVIEW_TOOL, schema: REVIEW_SCHEMA },
 });
@@ -733,6 +734,16 @@ a fixed set you can name up front — a yes/no gate, a pick-one label, a rubric 
 `ctx.sapiom.llm.decide` instead of an `output` schema: it returns calibrated probabilities
 over those answers (`res.answers.<key>.noul` / `.choice` + `.probabilities` / `.score`) with
 no tool, schema, or `structuredOf` step.
+
+**`max_tokens` covers thinking, not just output.** A routed label may emit a `thinking`
+block before the forced tool call, out of the same budget. If it runs out mid-deliberation
+the turn ends before the tool call is emitted and there is nothing to read — on the hardest
+inputs only, so a starved cap passes every easy case first. `llm.run` throws
+`LlmStructuredOutputTruncatedError` when that happens rather than handing back an
+unreadable response, and `pnpm examples:check` rejects a structured call capped under 2048.
+Catch it in a step with `canFail: true` and `fail()`: retrying the same request bills the
+thinking again and fails the same way. Billing settles on the tokens actually produced, but
+the cap is not free either — admission weight scales with it, so size it for the work.
 
 - **Don't ask for "ONLY minified JSON" and parse the reply.** The pattern this replaced
   took `output.indexOf("{")` to `output.lastIndexOf("}")` and `JSON.parse`'d it. Any
