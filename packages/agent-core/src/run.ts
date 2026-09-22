@@ -9,7 +9,7 @@
  */
 import { getOrchestrationAnalytics, telemetryErrorCode } from './analytics.js';
 import { GatewayClient } from './client.js';
-import { AgentOperationError } from './errors.js';
+import { AgentOperationError, requireNonEmpty } from './errors.js';
 
 export interface RunOptions {
   /** Server-side definition ID. */
@@ -30,13 +30,16 @@ export interface RunResult {
 /**
  * Start an execution of the named agent definition.
  *
- * Throws `AgentOperationError` (code `HTTP_*` | `NETWORK`) on gateway errors.
+ * Throws `AgentOperationError` (code `BAD_INPUT` | `HTTP_*` | `NETWORK`) on
+ * failures.
  *
  * Emits one `workflow.run` usage-analytics event (metadata only: ids,
  * status, duration — never the execution input). Live by default — see
  * ./analytics.ts; telemetry never changes the operation's behavior.
  */
 export async function run(opts: RunOptions, client: GatewayClient): Promise<RunResult> {
+  requireNonEmpty(opts.definitionId, 'definitionId');
+
   const startedAt = Date.now();
   try {
     const result = await runOperation(opts, client);
