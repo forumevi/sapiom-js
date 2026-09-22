@@ -909,3 +909,7 @@ export async function releaseSession(
     ),
   );
 }
+
+// `decide` — fixed-answer-set decisions with probabilities (TypeSafe Jev via the
+// Capability Router). See ./decide.ts.
+export * from "./decide.js";
