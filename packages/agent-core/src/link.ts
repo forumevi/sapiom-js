@@ -7,7 +7,7 @@
  */
 import { getOrchestrationAnalytics, telemetryErrorCode } from './analytics.js';
 import { GatewayClient } from './client.js';
-import { AgentOperationError } from './errors.js';
+import { AgentOperationError, requireNonEmpty } from './errors.js';
 
 export interface DefinitionSummary {
   id: string;
@@ -30,14 +30,16 @@ export interface LinkResult {
 /**
  * Resolve (or create) a server-side agent definition by name.
  *
- * Throws `AgentOperationError` (code `NOT_FOUND` | `HTTP_*` | `NETWORK`) on
- * failures.
+ * Throws `AgentOperationError` (code `BAD_INPUT` | `NOT_FOUND` | `HTTP_*` |
+ * `NETWORK`) on failures.
  *
  * Emits one `workflow.link` usage-analytics event (metadata only: name, id,
  * status, duration). Live by default — see ./analytics.ts; telemetry never
  * changes the operation's behavior.
  */
 export async function link(opts: LinkOptions, client: GatewayClient): Promise<LinkResult> {
+  requireNonEmpty(opts.name, 'name');
+
   const startedAt = Date.now();
   try {
     const result = await linkOperation(opts, client);
