@@ -38,3 +38,18 @@ export class AgentOperationError extends Error {
     };
   }
 }
+
+/**
+ * Throw a BAD_INPUT AgentOperationError when `value` is not a non-empty,
+ * non-whitespace string. Shared by networked functions that accept required
+ * string identifiers (executionId, name, correlationId, definitionId).
+ */
+export function requireNonEmpty(value: unknown, fieldName: string): asserts value is string {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new AgentOperationError({
+      code: 'BAD_INPUT',
+      message: `${fieldName} is required and must be a non-empty string.`,
+      hint: `Provide a non-empty value for \`${fieldName}\`.`,
+    });
+  }
+}
