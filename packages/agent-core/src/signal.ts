@@ -4,7 +4,7 @@
  * Networked operation: requires a GatewayClient. All inputs passed explicitly.
  */
 import { GatewayClient } from './client.js';
-import { AgentOperationError } from './errors.js';
+import { AgentOperationError, requireNonEmpty } from './errors.js';
 
 export interface SignalOptions {
   executionId: string;
@@ -23,6 +23,10 @@ export interface SignalResult {
  * Throws `AgentOperationError` on invalid payload or gateway errors.
  */
 export async function signal(opts: SignalOptions, client: GatewayClient): Promise<SignalResult> {
+  requireNonEmpty(opts.executionId, 'executionId');
+  requireNonEmpty(opts.name, 'name');
+  requireNonEmpty(opts.correlationId, 'correlationId');
+
   const res = await client.post<{ matched?: number }>(`/executions/${opts.executionId}/signals`, {
     name: opts.name,
     correlationId: opts.correlationId,
