@@ -228,10 +228,9 @@ export function matchesQuery(template: StudioTemplate, query: string): boolean {
 /**
  * Prompt handed to a session's agent to clone a DEPLOYED agent by its Sapiom
  * definition id — the deep-link ("Open in Studio") fallback when the agent isn't
- * on this machine yet. Mirrors the gallery branch of `useTemplatePrompt` but names
- * `definitionId`: the clone tool writes that id into the checkout's `sapiom.json`,
- * so the folder lands pre-linked and the server's workspace rescan surfaces it as
- * a workflow the SPA can focus.
+ * on this machine yet. It names `definitionId`: the clone tool writes that id into
+ * the checkout's `sapiom.json`, so the folder lands pre-linked and the server's
+ * workspace rescan surfaces it as a workflow the SPA can focus.
  */
 export function cloneDefinitionPrompt(definitionId: string, dir: string): string {
   return (
@@ -240,27 +239,6 @@ export function cloneDefinitionPrompt(definitionId: string, dir: string): string
     "If it reports you are not authenticated, run sapiom_authenticate first and retry. " +
     "After the clone, read the project's AGENTS.md and run npm install. " +
     "When the project is ready, offer a local test run with no Sapiom capability spend (sapiom_dev_agents_run_local) as the next step."
-  );
-}
-
-/**
- * What a session opens on after the HARNESS created the agent.
- *
- * It is not a scaffold prompt and must never read like one: the project is
- * already on disk, installed and committed, and an agent told to "scaffold a
- * new project in this directory" would find a non-empty folder and either
- * refuse or start over. So it says the scaffold is done, names the directory,
- * and hands over the only thing left — the user's instruction.
- */
-export function firstInstructionPrompt(
-  agentDir: string,
-  instruction: string,
-): string {
-  return (
-    `A new Sapiom agent project has just been created at ${agentDir} — the scaffold is done, ` +
-    "so do not scaffold or clone anything. Read its AGENTS.md, then use the sapiom-agent-authoring " +
-    `skill to build this:\n\n${instruction.trim()}\n\n` +
-    "When the agent is ready, offer a local test run with no Sapiom capability spend (sapiom_dev_agents_run_local) as the next step."
   );
 }
 
