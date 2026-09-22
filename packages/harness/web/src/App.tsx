@@ -96,6 +96,8 @@ import {
   type ProjectFolderIntent,
 } from "./components/ProjectFolderDialog";
 import { chooseProjectFolder } from "./lib/folder-step";
+import { templateIdea } from "./lib/creation-entry";
+import { NoProjectHome } from "./components/NoProjectHome";
 import { OverviewModal } from "./components/OverviewModal";
 import { WorkflowsRail } from "./components/WorkflowsRail";
 import { boundWorkflowPathOf, createApi, errorMessage } from "./lib/api";
@@ -109,6 +111,7 @@ import {
   slugifyIdea,
 } from "./lib/project-dir";
 import { basenameOf, isWithinDir, parentOf, samePath } from "./lib/paths";
+import { agentBelongsToProjectRoot } from "./lib/project-tree";
 import {
   canvasSourceFor,
   canvasSubject,
@@ -192,6 +195,8 @@ import {
   type RunTarget,
 } from "./lib/use-harness-state";
 import { useAgentMapEntry } from "./lib/use-agent-map-entry";
+import { agentMapLoader } from "./lib/agent-map-loader";
+import type { AgentMapWorkspaceResponse } from "@sapiom/agent-map";
 import {
   deploymentStateLabel,
   deploymentStateTitle,
@@ -492,7 +497,7 @@ export const App = (): JSX.Element => {
   const studioRestoreGenerationRef = useRef(0);
   // True while openProjectIntoRail awaits the server. The restoration effect
   // below yields to that open rather than bumping the generation it holds.
-  const projectOpenInFlightRef = useRef(false);
+  const projectOpensInFlightRef = useRef(0);
   const effectiveStudioSelection = effectiveStudioWorkspaceSelection(
     studioSelection,
     harness.state,
@@ -546,7 +551,7 @@ export const App = (): JSX.Element => {
     // session now falls under the folder being opened, this effect would
     // restore it and bump the generation, making that open reject its own
     // result and skip the new-agent screen. The open restores its own project.
-    if (projectOpenInFlightRef.current) return;
+    if (projectOpensInFlightRef.current > 0) return;
     const identityProjectId = active.agentMapIdentity?.projectId ?? null;
     const identityProject = identityProjectId
       ? state.studioProjects.find(
@@ -1355,7 +1360,7 @@ export const App = (): JSX.Element => {
     } else if (reviewSummary) {
       recordVisit({ kind: "review", summary: reviewSummary });
     } else if (composing) {
-      recordVisit({ kind: "composer" });
+      recordVisit({ kind: "composer", project: composerProject });
     } else if (
       activeSessionIdForNav &&
       (focusedAgentPath == null || focusHasLiveSession)
@@ -1375,6 +1380,7 @@ export const App = (): JSX.Element => {
     templatesOpen,
     reviewSummary,
     composing,
+    composerProject,
     activeSessionIdForNav,
     focusedAgentPath,
     focusHasLiveSession,
@@ -1391,7 +1397,20 @@ export const App = (): JSX.Element => {
       applyingVisitRef.current = true;
       setOverviewOpen(false);
       setTemplatesOpen(visit.kind === "templates");
-      setComposing(visit.kind === "composer");
+      // The screen derives its label and creation root from the project the
+      // visit was recorded with, not from whichever project opened it last.
+      // A project removed since the visit was recorded is not restored: the
+      // composer would otherwise create into a root the rail no longer holds.
+      const visitProject = visit.kind === "composer" ? visit.project : null;
+      const visitProjectOpen =
+        !visitProject ||
+        (harness.state?.workspaceScopes ?? []).some((scope) =>
+          samePath(scope.cwd, visitProject.root),
+        );
+      setComposing(visit.kind === "composer" && visitProjectOpen);
+      if (visit.kind === "composer") {
+        setComposerProject(visitProjectOpen ? visitProject ?? null : null);
+      }
       setReviewSummary(visit.kind === "review" ? visit.summary : null);
       if (
         visit.kind === "templates" ||
@@ -1897,6 +1916,50 @@ export const App = (): JSX.Element => {
     const studioProjectId = workspaceScopes.find(
       (scope) => scope.workspaceKey === workspaceKey,
     )?.projectId;
+    // AN EMPTY PROJECT'S NAME IS THE DOOR (D36, flow-creation.md §4.3). A
+    // project with nothing to draw lands on the new-agent screen scoped to it
+    // rather than on a map with nothing in it. "Nothing to draw" means no
+    // agent under the rail's own membership rule AND no map content: a
+    // durable project can carry map nodes the folder does not (the desktop
+    // smoke seeds one that way), so the map is consulted, from the loader's
+    // cache when it has it and by a load otherwise. New projects reach the
+    // screen through the folder step, not this door.
+    const holdsAgents = state.workflows.some((workflow) =>
+      agentBelongsToProjectRoot(workflow, root, workspaceScopes),
+    );
+    const generation = studioRestoreGenerationRef.current;
+    const openDoor = () =>
+      composeInProject({
+        root,
+        label,
+        projectId: studioProjectId ?? null,
+        template: null,
+      });
+    const mapIsEmpty = (snapshot: AgentMapWorkspaceResponse | null) =>
+      !snapshot ||
+      (snapshot.workspace.confirmedRevisionId === null && !snapshot.proposal);
+    if (!holdsAgents) {
+      if (!studioProjectId) {
+        openDoor();
+        return;
+      }
+      // The cache only receives deltas while a map is mounted, so a cached
+      // snapshot can be stale here; revalidate before letting emptiness route
+      // the selection. The map pane shows meanwhile; the door opens once the
+      // fresh read proves the map empty and this is still the selection.
+      agentMapLoader.invalidate(studioProjectId);
+      void agentMapLoader
+        .load(harness.api, studioProjectId)
+        .then((snapshot) => {
+          if (
+            mapIsEmpty(snapshot) &&
+            studioRestoreGenerationRef.current === generation
+          ) {
+            openDoor();
+          }
+        })
+        .catch(() => {});
+    }
     if (
       studioProjectId &&
       state.studioProjects?.some(
@@ -2139,11 +2202,11 @@ export const App = (): JSX.Element => {
   const openProjectIntoRail = async (
     requestedRoot: string,
   ): Promise<ComposerProject | null> => {
-    projectOpenInFlightRef.current = true;
+    projectOpensInFlightRef.current += 1;
     try {
       return await openProjectIntoRailUnguarded(requestedRoot);
     } finally {
-      projectOpenInFlightRef.current = false;
+      projectOpensInFlightRef.current -= 1;
     }
   };
   const openProjectIntoRailUnguarded = async (
@@ -2624,7 +2687,12 @@ export const App = (): JSX.Element => {
   const handleComposerSubmitIdea = async (
     idea: string,
     attachments: readonly NewSessionAttachment[],
+    sources: readonly string[],
   ): Promise<void> => {
+    // The pre-existing session-side scaffold, in the stated project, until
+    // slice 4 (SAP-3576) replaces it with the scaffold call of §4.4. The
+    // pasted links ride the first prompt after the idea so they reach the
+    // session rather than dying with the screen.
     const cwd = uniqueProjectDir(
       idea.trim() ? slugifyIdea(idea) : FALLBACK_PROJECT_NAME,
       composerRoot(),
@@ -2638,7 +2706,7 @@ export const App = (): JSX.Element => {
       keepComposerOpen: true,
       standaloneBuilder: true,
       scaffold: { template: "default" },
-      initialPrompt: idea.trim(),
+      initialPrompt: [idea.trim(), ...sources].filter(Boolean).join("\n"),
       initialAttachments: attachments.map((attachment) =>
         attachment.kind === "path"
           ? { kind: "path", path: attachment.path }
@@ -3259,6 +3327,10 @@ export const App = (): JSX.Element => {
                 studioRestoreGenerationRef.current += 1;
                 setStudioSelection(null);
               }
+              // The screen is mounted only with a project that exists.
+              if (composerProject && samePath(composerProject.root, root)) {
+                setComposerProject(null);
+              }
               await harness.removeProject(root);
             }}
             onOpenProject={openProjectIntoRail}
@@ -3411,6 +3483,9 @@ export const App = (): JSX.Element => {
               // every project tab until some unrelated path selected a CLI.
               composing={
                 showComposer && !(projectMapSelected && focusTabs.length > 0)
+              }
+              composerProjectLabel={
+                composing && composerProject ? composerProject.label : null
               }
               onBack={composerCanCancel ? () => setComposing(false) : null}
               activeSession={sessionBarSession}
@@ -3675,13 +3750,22 @@ export const App = (): JSX.Element => {
                     </AssistantPane>
                   </div>
                 </div>
-              ) : (
-                /* The composer-first home: no terminal, no canvas yet. Describe
-                   an outcome (or pick a template) and a session starts; this
-                   screen gives way to the terminal (createSessionAt clears
-                   `composing`), and the canvas reveals itself once populated. */
+              ) : composing && composerProject ? (
+                /* THE NEW-AGENT SCREEN, scoped to a project (§4.3): no
+                   terminal, no canvas yet. Describe the agent and submit; the
+                   harness scaffolds it and a normal session opens on it, and
+                   this screen gives way to the terminal. Keyed on the project
+                   and the template so a second entrance starts clean. Only
+                   while composing: a project stated on an earlier visit does
+                   not bring the screen back when the centre empties. */
                 <NewSessionComposer
+                  key={`${composerProject.root}::${composerProject.template?.id ?? ""}`}
                   project={composerProject}
+                  initialIdea={
+                    composerProject.template
+                      ? templateIdea(composerProject.template)
+                      : undefined
+                  }
                   harness={selectedHarness}
                   entries={harnessEntries ?? FALLBACK_HARNESSES}
                   onHarnessChange={setSelectedHarness}
@@ -3702,15 +3786,23 @@ export const App = (): JSX.Element => {
                   onToggleTelemetry={async (next) => {
                     await harness.updateSettings({ telemetryOptIn: next });
                   }}
-                  recentDirs={harness.settings?.recentDirs ?? []}
-                  projectRoot={projectRoot || null}
-                  listDir={harness.listDir}
-                  onConnect={async (cwd) => {
-                    await harness.connectWorkflow(cwd);
+                />
+              ) : (
+                /* Nothing to show and no project chosen to create in: a fresh
+                   install or every project removed says so; projects in the
+                   rail with nothing open says that instead. Either way the
+                   one move is New project, or a row. */
+                <NoProjectHome
+                  hasProjects={
+                    workspaceScopes.length > 0 ||
+                    (harness.settings?.recentDirs?.length ?? 0) > 0
+                  }
+                  onNewProject={handleNewProject}
+                  firstRun={state.firstRun === true}
+                  telemetryOptIn={harness.settings?.telemetryOptIn === true}
+                  onToggleTelemetry={async (next) => {
+                    await harness.updateSettings({ telemetryOptIn: next });
                   }}
-                  onScan={handleScanWorkflows}
-                  onScaffold={handleScaffoldSession}
-                  onSaveProjectRoot={saveProjectRoot}
                 />
               )}
             </div>

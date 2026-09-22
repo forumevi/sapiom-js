@@ -1,6 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
 import type { CreateSessionRequest } from "../../src/shared/types";
 
+import { openNewAgentScreen } from "./mock-navigation";
+
 interface CreationEvidence {
   createSessionCalls?: { req: CreateSessionRequest }[];
   createOrder?: string[];
@@ -70,14 +72,16 @@ for (const scenario of [
     harness: "claude-code",
   },
 ] as const) {
-  test(`the automatic home retains ${scenario.name} after failure and retries once`, async ({
+  test(`the screen retains ${scenario.name} after failure and retries once`, async ({
     page,
   }) => {
-    // Do not click Create new: that explicitly activates the composer and
-    // would hide the automatic-home state bug this test must exercise.
+    // A fresh install has no project, so the first thing is New project (the
+    // folder step), and the new-agent screen it lands on is where these files
+    // are queued.
     await page.goto("/?mockState=fresh");
+    await expect(page.getByTestId("no-project-home")).toBeVisible();
+    await openNewAgentScreen(page);
     const composer = page.getByTestId("new-session-composer");
-    await expect(composer).toBeVisible();
     await composer.evaluate((node) => {
       node.setAttribute("data-original-draft", "true");
     });
@@ -98,7 +102,7 @@ for (const scenario of [
       send.click();
     });
 
-    await expect(page.getByTestId("toast")).toContainText(
+    await expect(page.getByTestId("new-agent-error")).toContainText(
       /materialization failed/i,
     );
     // Reopening an empty composer after the error is not recovery: its local
@@ -124,9 +128,11 @@ for (const scenario of [
     expect(failed.injectInputCalls ?? []).toHaveLength(0);
     const firstRequest = failed.createSessionCalls![0]!.req;
     expect(failed.createOrder).toEqual([`scaffold:${firstRequest.cwd}`]);
-    // Discovery has reached the UI even though the unrooted section is
-    // collapsed by default on a fresh install.
-    await expect(page.getByTestId("unrooted-count")).toHaveText("1");
+    // Discovery has reached the UI: the scaffolded folder is a row under the
+    // project the screen stated (it was created in it, not beside it).
+    await expect(
+      page.getByTestId(`workflow-${firstRequest.cwd.split("/").pop()}`),
+    ).toBeVisible();
 
     await page.getByTestId("composer-send").click();
     await expect(composer).toHaveCount(0);
@@ -166,11 +172,11 @@ for (const scenario of [
   });
 }
 
-test("the automatic home stays mounted until a delayed first request is prepared", async ({
+test("the screen stays mounted until a delayed first request is prepared", async ({
   page,
 }) => {
   await page.goto("/?mockState=fresh");
-  await expect(page.getByTestId("new-session-composer")).toBeVisible();
+  await openNewAgentScreen(page);
   await page.getByTestId("composer-input").fill("Use both files.");
   await queueFiles(page, false);
   await page.evaluate(() => {
