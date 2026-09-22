@@ -49,7 +49,6 @@ import { CREATE_SESSION_JSON_LIMIT_BYTES, JSON_BODY_LIMIT_BYTES } from "../share
 import type {
   ProjectBootstrapLifecycleEvent,
   ProjectAgentSession,
-  StudioProjectSummary,
 } from "@sapiom/agent-map";
 import {
   projectRoots,
@@ -1422,7 +1421,7 @@ export const startServer = async (
     // project before config generation and PTY spawn, never during resume.
     const initialPrompt = context?.resume
       ? undefined
-      : await prepareFirstRequest(req, scaffoldDeps);
+      : await prepareFirstRequest(req);
     if (!context?.agentMapIdentity) {
       return { ...(await innerBuildLaunchOpts(harnessSessionId, req, context)), ...(initialPrompt ? { initialPrompt } : {}) };
     }
